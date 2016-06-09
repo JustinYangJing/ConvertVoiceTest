@@ -32,7 +32,7 @@ typedef struct {
 //接收区数据为一个循环队列
 #define kRawDataLen (512*100)
 typedef struct {
-    NSInteger font;
+    NSInteger front;
     NSInteger rear;
     SInt16   receiveRawData[kRawDataLen];
 } RawData;
@@ -52,6 +52,7 @@ typedef struct {
 @property (nonatomic,weak)   AVAudioSession *session;
 @property (nonatomic,assign) AudioComponentInstance toneUnit;
 
+@property (weak, nonatomic) IBOutlet UIButton *convertBtn;
 
 @end
 
@@ -93,39 +94,29 @@ static void CheckError(OSStatus error,const char *operaton){
 }
 
 
-/**
- *  被中断时，开始中断，停止音频输出，结束中断，恢复音频输出
- *
- *  @param noti <#noti description#>
- */
--(void)audioSessionInterruptHandle:(NSNotification *)noti{
-    NSDictionary *dic = noti.userInfo;
-    if ([dic[ AVAudioSessionInterruptionTypeKey] integerValue] == AVAudioSessionInterruptionTypeBegan) {
-        AudioOutputUnitStop(_toneUnit);
-    }else if ([dic[ AVAudioSessionInterruptionTypeKey] integerValue] == AVAudioSessionInterruptionTypeEnded) {
-        [self.session setActive:YES error:nil];
-    }
-    
-}
+
 
 -(void)audioSessionRouteChangeHandle:(NSNotification *)noti{
-    //为什么要先dispose _toneUnit，在新建一个
     if ([noti.userInfo[AVAudioSessionRouteChangeReasonKey] integerValue] ==
-        AVAudioSessionRouteChangeReasonCategoryChange) {
+        AVAudioSessionRouteChangeReasonOldDeviceUnavailable) { //拔出耳塞
+        CheckError(AudioOutputUnitStop(_toneUnit), "couldn't start remote i/o unit");
+        self.convertBtn.selected = NO;
+        
+    }else  if ([noti.userInfo[AVAudioSessionRouteChangeReasonKey] integerValue] ==
+               AVAudioSessionRouteChangeReasonNewDeviceAvailable){
         for (AVAudioSessionPortDescription* desc in [self.session.currentRoute outputs]) {
             if ([[desc portType] isEqualToString:AVAudioSessionPortHeadphones])
                 return;
         }
         CheckError(AudioOutputUnitStop(_toneUnit), "couldn't start remote i/o unit");
-
+        self.convertBtn.selected = NO;
+        
     }
 
 }
 
 //const CGFloat Bb[] = {0.9635,   -3.8538,    5.7807,   -3.8538,    0.9635};
 //const CGFloat Ba[] = { 1.0000,   -3.9255,    5.7794,   -3.7821,    0.9282};
-const CGFloat Bb[] = { 0.8300,   -3.3200,    4.9800,   -3.3200,    0.8300};
-const CGFloat Ba[] = { 1.0000,   -3.6278,    4.9512,   -3.0119,    0.6889};
 
 OSStatus inputRenderTone(
                          void *inRefCon,
@@ -143,7 +134,6 @@ OSStatus inputRenderTone(
     bufferList.mNumberBuffers = 1;
     bufferList.mBuffers[0].mData = NULL;
     bufferList.mBuffers[0].mDataByteSize = 0;
-    
     OSStatus status = AudioUnitRender(THIS->_toneUnit,
                                       ioActionFlags,
                                       inTimeStamp,
@@ -151,13 +141,11 @@ OSStatus inputRenderTone(
                                       inNumberFrames,
                                       &bufferList);
     
-    
     SInt16 *rece = (SInt16 *)bufferList.mBuffers[0].mData;
-    SInt16 *tmp = (SInt16 *)malloc(bufferList.mBuffers[0].mDataByteSize);
-    memcpy(tmp, rece, bufferList.mBuffers[0].mDataByteSize);
+//    SInt16 *tmp = (SInt16 *)malloc(bufferList.mBuffers[0].mDataByteSize);
+//    memcpy(tmp, rece, bufferList.mBuffers[0].mDataByteSize);
     for (int i = 0; i < inNumberFrames; i++) {
-        rece[i] = rece[i]*THIS->_convertCos[i];
-//        //            y(i)=(b1*x(i)+b2*x(i-1)+b3*x(i-2)+b4*x(i-3)-a2*y(i-1)-a3*y(i-2)-a4*y(i-3));
+        rece[i] = rece[i]*THIS->_convertCos[i];//频谱搬移
 //        if (i < 4) {
 //            if (i == 1) {
 //                rece[1]=Bb[0]*tmp[1]+Bb[1]*tmp[0]-Ba[1]*rece[0];
@@ -176,7 +164,7 @@ OSStatus inputRenderTone(
 //            Ba[1]*rece[i-1]-Ba[2]*rece[i-2]-Ba[3]*rece[i-3]-Ba[4]*rece[i-4];
 //        }
     }
-    
+//    free(tmp);
     RawData *rawData = &THIS->_rawData;
     //距离最大位置还有mDataByteSize/2 那就直接memcpy,否则要一个一个字节拷贝
     if((rawData->rear+bufferList.mBuffers[0].mDataByteSize/2) <= kRawDataLen){
@@ -185,7 +173,7 @@ OSStatus inputRenderTone(
     }else{
         uint8_t *pIOdata = (uint8_t *)bufferList.mBuffers[0].mData;
         for (int i = 0; i < rawData->rear+bufferList.mBuffers[0].mDataByteSize; i+=2) {
-            SInt16 data = pIOdata[i]<<8 | pIOdata[i+1];
+            SInt16 data = pIOdata[i] | pIOdata[i+1]<<8;
             rawData->receiveRawData[rawData->rear] = data;
             rawData->rear = (rawData->rear+1)%kRawDataLen;
         }
@@ -207,9 +195,9 @@ OSStatus outputRenderTone(
     SInt16 *outSamplesChannelLeft   = (SInt16 *)ioData->mBuffers[0].mData;
     RawData *rawData = &THIS->_rawData;
     for (UInt32 frameNumber = 0; frameNumber < inNumberFrames; ++frameNumber) {
-        if (rawData->font != rawData->rear) {
-            outSamplesChannelLeft[frameNumber] = (rawData->receiveRawData[rawData->font]);
-            rawData->font = (rawData->font+1)%kRawDataLen;
+        if (rawData->front != rawData->rear) {
+            outSamplesChannelLeft[frameNumber] = (rawData->receiveRawData[rawData->front]);
+            rawData->front = (rawData->front+1)%kRawDataLen;
             
         }
     }
@@ -217,22 +205,15 @@ OSStatus outputRenderTone(
 }
 - (void)configAudio
 {
-    
-    UInt32 size;
+
     _inputProc.inputProc = inputRenderTone;
     _inputProc.inputProcRefCon = (__bridge void *)(self);
     _outputProc.inputProc = outputRenderTone;
     _outputProc.inputProcRefCon = (__bridge void *)(self);
     
     //对AudioSession的一些设置
-    self.session = [AVAudioSession sharedInstance];
-    //音频中断发生(被别的app中断等)
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioSessionInterruptHandle:) name:AVAudioSessionInterruptionNotification object:self.session];
-    
     NSError *error;
-    [self.session setActive:YES error:&error];
-    handleError(error);
-    
+    self.session = [AVAudioSession sharedInstance];
     [self.session setCategory:AVAudioSessionCategoryPlayAndRecord error:&error];
     handleError(error);
     //route变化监听
@@ -241,6 +222,9 @@ OSStatus outputRenderTone(
     [self.session setPreferredIOBufferDuration:0.005 error:&error];
     handleError(error);
     [self.session setPreferredSampleRate:kSmaple error:&error];
+    handleError(error);
+
+    [self.session setActive:YES error:&error];
     handleError(error);
     
     
@@ -255,10 +239,8 @@ OSStatus outputRenderTone(
     AudioComponent inputComponent = AudioComponentFindNext(NULL, &acd);
     AudioComponentInstanceNew(inputComponent, &_toneUnit);
     
-    //The Remote I/O unit, by default, has output enabled and input disabled
-    //Enable input scope of input bus for recording.
+
     UInt32 enable = 1;
-    //mic连接上scope_input的 element1
     AudioUnitSetProperty(_toneUnit,
                          kAudioOutputUnitProperty_EnableIO,
                          kAudioUnitScope_Input,
@@ -270,44 +252,60 @@ OSStatus outputRenderTone(
                          kAudioUnitScope_Output,
                          kOutoutBus, &enable, sizeof(enable));
     
-    
-    CheckError(AudioUnitSetProperty(_toneUnit, kAudioOutputUnitProperty_SetInputCallback,
-                                    kAudioUnitScope_Global, kInputBus,
-                                    &_inputProc, sizeof(_inputProc)),
-               "couldnt set remote i/o render callback for input");
-    
-    CheckError(AudioUnitSetProperty(_toneUnit, kAudioUnitProperty_SetRenderCallback,
-                                    kAudioUnitScope_Global, kOutoutBus,
-                                    &_outputProc, sizeof(_outputProc)),
-               "couldnt set remote i/o render callback for output");
-    
-    mAudioFormat.mSampleRate=kSmaple;//采样率（立体声＝8000）
-    mAudioFormat.mFormatID=kAudioFormatLinearPCM;//PCM格式
+    mAudioFormat.mSampleRate         = kSmaple;//采样率
+    mAudioFormat.mFormatID           = kAudioFormatLinearPCM;//PCM采样
     mAudioFormat.mFormatFlags        = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
     mAudioFormat.mFramesPerPacket    = 1;//每个数据包多少帧
-    mAudioFormat.mChannelsPerFrame   = 2/2;//1单声道，2立体声
+    mAudioFormat.mChannelsPerFrame   = 1;//1单声道，2立体声
     mAudioFormat.mBitsPerChannel     = 16;//语音每采样点占用位数
     mAudioFormat.mBytesPerFrame      = mAudioFormat.mBitsPerChannel*mAudioFormat.mChannelsPerFrame/8;//每帧的bytes数
     mAudioFormat.mBytesPerPacket     = mAudioFormat.mBytesPerFrame*mAudioFormat.mFramesPerPacket;//每个数据包的bytes总数，每帧的bytes数＊每个数据包的帧数
     mAudioFormat.mReserved           = 0;
     
-    CheckError(AudioUnitSetProperty(_toneUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, kOutoutBus, &mAudioFormat, sizeof(mAudioFormat)), "couldn't set the remote I/O unit's output client format");
-    CheckError(AudioUnitSetProperty(_toneUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, kInputBus, &mAudioFormat, sizeof(mAudioFormat)), "couldn't set the remote I/O unit's input client format");
+    CheckError(AudioUnitSetProperty(_toneUnit,
+                                    kAudioUnitProperty_StreamFormat,
+                                    kAudioUnitScope_Input, kOutoutBus,
+                                    &mAudioFormat, sizeof(mAudioFormat)),
+               "couldn't set the remote I/O unit's output client format");
+    CheckError(AudioUnitSetProperty(_toneUnit,
+                                    kAudioUnitProperty_StreamFormat,
+                                    kAudioUnitScope_Output, kInputBus,
+                                    &mAudioFormat, sizeof(mAudioFormat)),
+               "couldn't set the remote I/O unit's input client format");
     
-    CheckError(AudioUnitInitialize(_toneUnit), "couldn't initialize the remote I/O unit");
-    //Obtain a RemoteIO unit instance
-    UInt32 maxFPSt;
-    size = sizeof(maxFPSt);
-    CheckError(AudioUnitGetProperty(_toneUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFPSt, &size), "couldn't get the remote I/O unit's max frames per slice");
-    //Create an audio file for recording
+    CheckError(AudioUnitSetProperty(_toneUnit,
+                                    kAudioOutputUnitProperty_SetInputCallback,
+                                    kAudioUnitScope_Output,
+                                    kInputBus,
+                                    &_inputProc, sizeof(_inputProc)),
+               "couldnt set remote i/o render callback for input");
     
+    CheckError(AudioUnitSetProperty(_toneUnit,
+                                    kAudioUnitProperty_SetRenderCallback,
+                                    kAudioUnitScope_Input,
+                                    kOutoutBus,
+                                    &_outputProc, sizeof(_outputProc)),
+               "couldnt set remote i/o render callback for output");
     
-    CheckError(AudioOutputUnitStart(_toneUnit), "couldn't start remote i/o unit");
-    size = sizeof(mAudioFormat);
-    CheckError(AudioUnitGetProperty(_toneUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output,1, &mAudioFormat,&size), "couldn't get the remote I/O unit's output client format");
+    CheckError(AudioUnitInitialize(_toneUnit),
+               "couldn't initialize the remote I/O unit");
 }
-- (IBAction)covertHandle:(id)sender {
-    
+- (IBAction)covertHandle:(UIButton *)sender {
+    if (sender.selected == NO) {
+        for (AVAudioSessionPortDescription* desc in [self.session.currentRoute outputs]) {
+            if ([[desc portType] isEqualToString:AVAudioSessionPortHeadphones]){
+                CheckError(AudioOutputUnitStart(_toneUnit), "couldn't start remote i/o unit");
+                sender.selected = YES;
+                return;
+            }
+
+        }
+        UIAlertView *view = [[UIAlertView alloc] initWithTitle:@"警告" message:@"请插入耳塞" delegate:self cancelButtonTitle:@"确定" otherButtonTitles:nil];
+        [view show];
+    }else{
+        CheckError(AudioOutputUnitStop(_toneUnit), "couldn't stop remote i/o unit");
+        sender.selected = NO;
+    }
 }
 
 @end
