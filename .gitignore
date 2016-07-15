@@ -1,0 +1,9 @@
+reddata/
+xcuserdata/
+xcuserdata
+xcshareddata
+Pods
+*.o
+*.lo
+.swp
+.DS_Store
